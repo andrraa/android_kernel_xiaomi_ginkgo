@@ -482,38 +482,16 @@ static void ion_dma_buf_release(struct dma_buf *dmabuf)
 static void *ion_dma_buf_vmap(struct dma_buf *dmabuf)
 {
 	struct ion_buffer *buffer = dmabuf->priv;
-	void *vaddr = ERR_PTR(-EINVAL);
+	void *vaddr;
 
-	if (buffer->heap->ops->map_kernel) {
-		mutex_lock(&buffer->lock);
-		vaddr = ion_buffer_kmap_get(buffer);
-		mutex_unlock(&buffer->lock);
-	} else {
-		pr_warn_ratelimited("heap %s doesn't support map_kernel\n",
-				    buffer->heap->name);
+	if (!buffer->heap->ops->map_kernel) {
+		pr_err("%s: map kernel is not implemented by this heap.\n",
+		       __func__);
+		return ERR_PTR(-ENOTTY);
 	}
-
-	return vaddr;
-}
-
-static void ion_dma_buf_vunmap(struct dma_buf *dmabuf, void *vaddr)
-{
-	struct ion_buffer *buffer = dmabuf->priv;
-
-	if (buffer->heap->ops->map_kernel) {
-		mutex_lock(&buffer->lock);
-		ion_buffer_kmap_put(buffer);
-		mutex_unlock(&buffer->lock);
-	}
-}
-
-static void *ion_dma_buf_kmap(struct dma_buf *dmabuf, unsigned long offset)
-{
-	/*
-	 * TODO: Once clients remove their hacks where they assume kmap(ed)
-	 * addresses are virtually contiguous implement this properly
-	 */
-	void *vaddr = ion_dma_buf_vmap(dmabuf);
+	mutex_lock(&buffer->lock);
+	vaddr = ion_buffer_kmap_get(buffer);
+	mutex_unlock(&buffer->lock);
 
 	if (IS_ERR(vaddr))
 		return vaddr;
@@ -524,11 +502,14 @@ static void *ion_dma_buf_kmap(struct dma_buf *dmabuf, unsigned long offset)
 static void ion_dma_buf_kunmap(struct dma_buf *dmabuf, unsigned long offset,
 			       void *ptr)
 {
-	/*
-	 * TODO: Once clients remove their hacks where they assume kmap(ed)
-	 * addresses are virtually contiguous implement this properly
-	 */
-	ion_dma_buf_vunmap(dmabuf, ptr);
+	struct ion_buffer *buffer = dmabuf->priv;
+
+	if (buffer->heap->ops->map_kernel) {
+		mutex_lock(&buffer->lock);
+		ion_buffer_kmap_put(buffer);
+		mutex_unlock(&buffer->lock);
+	}
+
 }
 
 static int ion_sgl_sync_range(struct device *dev, struct scatterlist *sgl,
@@ -640,50 +621,6 @@ static int __ion_dma_buf_begin_cpu_access(struct dma_buf *dmabuf,
 			dma_sync_sg_for_cpu(dev, table->sgl,
 					    table->nents, direction);
 
-		mutex_unlock(&buffer->lock);
-		goto out;
-	}
-
-	list_for_each_entry(a, &buffer->attachments, list) {
-		int tmp = 0;
-
-		if (!a->dma_mapped)
-			continue;
-
-		if (sync_only_mapped)
-			tmp = ion_sgl_sync_mapped(a->dev, a->table->sgl,
-						  a->table->nents,
-						  &buffer->vmas,
-						  direction, true);
-		else
-			dma_sync_sg_for_cpu(a->dev, a->table->sgl,
-					    a->table->nents, direction);
-
-		if (tmp)
-			ret = tmp;
-	}
-	mutex_unlock(&buffer->lock);
-
-out:
-	return ret;
-}
-
-static int __ion_dma_buf_end_cpu_access(struct dma_buf *dmabuf,
-					enum dma_data_direction direction,
-					bool sync_only_mapped)
-{
-	struct ion_buffer *buffer = dmabuf->priv;
-	struct ion_dma_buf_attachment *a;
-	int ret = 0;
-
-	if (!hlos_accessible_buffer(buffer)) {
-		ret = -EPERM;
-		goto out;
-	}
-
-	if (!(buffer->flags & ION_FLAG_CACHED))
-		goto out;
-
 	mutex_lock(&buffer->lock);
 	if (IS_ENABLED(CONFIG_ION_FORCE_DMA_SYNC)) {
 		struct device *dev = buffer->heap->priv;
@@ -773,45 +710,6 @@ static int ion_dma_buf_begin_cpu_access_partial(struct dma_buf *dmabuf,
 
 		ret = ion_sgl_sync_range(dev, table->sgl, table->nents,
 					 offset, len, dir, true);
-
-		mutex_unlock(&buffer->lock);
-		goto out;
-	}
-
-	list_for_each_entry(a, &buffer->attachments, list) {
-		int tmp = 0;
-
-		if (!a->dma_mapped)
-			continue;
-
-		tmp = ion_sgl_sync_range(a->dev, a->table->sgl, a->table->nents,
-					 offset, len, dir, true);
-
-		if (tmp)
-			ret = tmp;
-	}
-	mutex_unlock(&buffer->lock);
-
-out:
-	return ret;
-}
-
-static int ion_dma_buf_end_cpu_access_partial(struct dma_buf *dmabuf,
-					      enum dma_data_direction direction,
-					      unsigned int offset,
-					      unsigned int len)
-{
-	struct ion_buffer *buffer = dmabuf->priv;
-	struct ion_dma_buf_attachment *a;
-	int ret = 0;
-
-	if (!hlos_accessible_buffer(buffer)) {
-		ret = -EPERM;
-		goto out;
-	}
-
-	if (!(buffer->flags & ION_FLAG_CACHED))
-		goto out;
 
 	mutex_lock(&buffer->lock);
 	if (IS_ENABLED(CONFIG_ION_FORCE_DMA_SYNC)) {
